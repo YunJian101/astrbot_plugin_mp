@@ -21,7 +21,7 @@ import astrbot.api
 from astrbot.api import logger
 
 # --- 插件介绍代码内容 ---
-@register("astrbot_plugin_mp", "EWEDL", "MoviePilot小工具", "1.5.0")
+@register("astrbot_plugin_mp", "EWEDL", "MoviePilot小工具", "1.6.0")
 class MediaSearchPlugin(Star):
     """集成媒体搜索、订阅管理以及基于HTTP的分类消息通知功能。
     支持持久化订阅和文件日志。"""
@@ -432,7 +432,7 @@ class MediaSearchPlugin(Star):
                 http_status = f"运行中 ✅ - http://{ip_addr}:{self.listen_port}"
             else:
                 http_status = f"未运行 ❌ - 端口 {self.listen_port}"
-        menu_text = f"""📺 mp 功能菜单 v1.5.0 📺
+        menu_text = f"""📺 mp 功能菜单 v1.6.0 📺
 ---------------------------------
 【媒体管理】
   mp 搜索 [关键词] > 搜索媒体。 例: mp 搜索 黑暗荣耀
@@ -448,6 +448,7 @@ class MediaSearchPlugin(Star):
 可用类别: 资源下载,整理入库,订阅,媒体服务器,手动处理,插件,其他,站点,所有
 HTTP服务: {http_status}
 ---------------------------------
+提示: 也可以直接用自然语言对话，大模型会自动调用搜索、订阅、查看订阅、通知等能力
 注意: 所有命令仅支持小写形式(mp)"""
         yield event.plain_result(menu_text.strip())
         
@@ -491,7 +492,7 @@ HTTP服务: {http_status}
             return
         media_item = search_results[idx]
         media_title = media_item.get("title", "未知")
-        source = media_item.get("source", "")
+        source = media_item.get("source") or media_item.get("media_source", "")
         tmdbid = media_item.get("tmdb_id")
         media_type = media_item.get("type", "")
         # 只有电视剧才查季
@@ -510,6 +511,8 @@ HTTP服务: {http_status}
                     async with session.get(tmdb_url, headers=headers) as resp:
                         if resp.status == 200:
                             seasons = await resp.json()
+                            if isinstance(seasons, dict):  # 兼容 {"success":..., "data": [...]} 包装
+                                seasons = seasons.get("data")
                             if isinstance(seasons, list) and len(seasons) > 1:
                                 # 多季，提示用户选择
                                 season_list = []
@@ -534,7 +537,7 @@ HTTP服务: {http_status}
                                 if response and response.get("success") == True:
                                     yield event.plain_result(f"✅ `{media_title}` 订阅成功。")
                                 else:
-                                    error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                                    error_msg = (response.get("msg") or response.get("message") or "看日志。") if isinstance(response, dict) else "看日志。"
                                     yield event.plain_result(f"⚠️ 订阅 `{media_title}` 失败: {error_msg}")
                                 return
                             else:
@@ -557,7 +560,7 @@ HTTP服务: {http_status}
         if response and response.get("success") == True:
             yield event.plain_result(f"✅ `{media_title}` 订阅成功。")
         else:
-            error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+            error_msg = (response.get("msg") or response.get("message") or "看日志。") if isinstance(response, dict) else "看日志。"
             yield event.plain_result(f"⚠️ 订阅 `{media_title}` 失败: {error_msg}")
         
     @mp.command("查看订阅")
@@ -589,7 +592,7 @@ HTTP服务: {http_status}
             if search_result.get("success"):
                 yield event.plain_result(f"✅ 执行订阅搜索{' (ID: ' + subscription_id + ')' if subscription_id else ''}。看后台任务。")
             else:
-                msg = search_result.get("msg", "?")
+                msg = search_result.get("msg") or search_result.get("message") or "?"
                 yield event.plain_result(f"⚠️ 订阅搜索API失败: {msg}")
         else:
             yield event.plain_result("⚠️ 无法获取订阅搜索结果。")
@@ -598,23 +601,44 @@ HTTP服务: {http_status}
     async def enable_notification_command(self, event: AstrMessageEvent, categories_str: str):
         """启用指定类别的通知"""
         chat_id = str(event.unified_msg_origin)
-        cats_add = set(c.strip() for c in categories_str.split('|') if c.strip())
-        
-        if not cats_add:
-            yield event.plain_result(f"⚠️ 请指定类别. 可用: {', '.join(sorted(ALLOWED_CATEGORIES))}")
-            return
-            
-        valid_cats = cats_add & ALLOWED_CATEGORIES
-        invalid_cats = cats_add - ALLOWED_CATEGORIES
-        
+        result_text = self._enable_notification_categories(chat_id, self._parse_categories(categories_str))
+        yield event.plain_result(result_text)
+
+    @mp.command("取消通知")
+    async def disable_notification_command(self, event: AstrMessageEvent, categories_str: str):
+        """取消指定类别的通知"""
+        chat_id = str(event.unified_msg_origin)
+        result_text = self._disable_notification_categories(chat_id, self._parse_categories(categories_str))
+        yield event.plain_result(result_text)
+
+    # --- LLM 函数工具：大模型可在对话中自动调用，无需用户发送指令 ---
+
+    async def _get_valid_token(self):
+        """获取可用的访问令牌，失败时返回 None"""
+        if self.access_token:
+            return self.access_token
+        self.access_token = await self.get_access_token(self.username, self.password, self.token_url)
+        return self.access_token
+
+    def _parse_categories(self, categories_str: str) -> set:
+        """解析通知类别字符串，支持 | , ， 、 和空格分隔"""
+        return {c.strip() for c in re.split(r"[|,，、\s]+", categories_str or "") if c.strip()}
+
+    def _enable_notification_categories(self, chat_id: str, categories: set) -> str:
+        """启用指定类别的通知，返回结果文本"""
+        if not categories:
+            return f"⚠️ 请指定类别. 可用: {', '.join(sorted(ALLOWED_CATEGORIES))}"
+
+        valid_cats = categories & ALLOWED_CATEGORIES
+        invalid_cats = categories - ALLOWED_CATEGORIES
+
         if not valid_cats:
-            yield event.plain_result(f"⚠️ 类别无效. 可用: {', '.join(sorted(ALLOWED_CATEGORIES - {'所有'}))} 或 '所有'")
-            return
-            
+            return f"⚠️ 类别无效. 可用: {', '.join(sorted(ALLOWED_CATEGORIES - {'所有'}))} 或 '所有'"
+
         added = set()
         current = self.notification_subscriptions.setdefault(chat_id, set())
         changed = False
-        
+
         if "所有" in valid_cats:
             if "所有" not in current or len(current) > 1:
                 current.clear()
@@ -625,93 +649,285 @@ HTTP服务: {http_status}
             if "所有" in current:
                 current.remove("所有")
                 changed = True
-                
             for cat in valid_cats:
                 if cat not in current:
                     current.add(cat)
                     added.add(cat)
                     changed = True
-        
+
         if changed:
             self._save_subscriptions()
-            
+
         parts = []
         if added:
             parts.append(f"✅ 已启用: {', '.join(sorted(added))}。")
         elif valid_cats:
             parts.append(f"ℹ️ 已启用状态: {', '.join(sorted(valid_cats))}。")
-            
         if invalid_cats:
             parts.append(f"⚠️ 忽略无效: {', '.join(sorted(invalid_cats))}。")
-            
         final = self.notification_subscriptions.get(chat_id, set())
         parts.append(f"当前启用: {', '.join(sorted(final)) if final else '无'}")
-        
-        yield event.plain_result("\n".join(parts))
-        
-    @mp.command("取消通知")
-    async def disable_notification_command(self, event: AstrMessageEvent, categories_str: str):
-        """取消指定类别的通知"""
-        chat_id = str(event.unified_msg_origin)
-        cats_rem = set(c.strip() for c in categories_str.split('|') if c.strip())
-        
-        if not cats_rem:
-            yield event.plain_result(f"⚠️ 请指定类别. 可用: {', '.join(sorted(ALLOWED_CATEGORIES))}")
-            return
-            
+        return "\n".join(parts)
+
+    def _disable_notification_categories(self, chat_id: str, categories: set) -> str:
+        """取消指定类别的通知，返回结果文本"""
+        if not categories:
+            return f"⚠️ 请指定类别. 可用: {', '.join(sorted(ALLOWED_CATEGORIES))}"
+
         current = self.notification_subscriptions.get(chat_id)
         if not current:
-            yield event.plain_result("ℹ️ 当前无启用通知。")
-            return
-            
+            return "ℹ️ 当前无启用通知。"
+
+        if "所有" in categories:
+            del self.notification_subscriptions[chat_id]
+            self._save_subscriptions()
+            return "✅ 已取消所有通知。"
+
+        valid_rem = categories & ALLOWED_CATEGORIES
+        invalid_cats = categories - ALLOWED_CATEGORIES
+
+        if not valid_rem:
+            return f"⚠️ 类别无效. 可用: {', '.join(sorted(ALLOWED_CATEGORIES - {'所有'}))} 或 '所有'"
+
         removed = set()
         changed = False
-        
-        if "所有" in cats_rem:
-            if chat_id in self.notification_subscriptions:
-                del self.notification_subscriptions[chat_id]
+        for cat in valid_rem:
+            if cat in current:
+                current.remove(cat)
+                removed.add(cat)
                 changed = True
-                yield event.plain_result("✅ 已取消所有通知。")
-            else:
-                yield event.plain_result("ℹ️ 当前无启用通知。")
-                
-            if changed:
-                self._save_subscriptions()
-            return
-            
-        valid_rem = cats_rem & ALLOWED_CATEGORIES
-        invalid_cats = cats_rem - ALLOWED_CATEGORIES
-        
-        if not valid_rem:
-            yield event.plain_result(f"⚠️ 类别无效. 可用: {', '.join(sorted(ALLOWED_CATEGORIES - {'所有'}))} 或 '所有'")
-            return
-            
-        if chat_id in self.notification_subscriptions:
-            for cat in valid_rem:
-                if cat in current:
-                    current.remove(cat)
-                    removed.add(cat)
-                    changed = True
-                    
-            if not current:
-                del self.notification_subscriptions[chat_id]
-                
+
+        if not current:
+            self.notification_subscriptions.pop(chat_id, None)
         if changed:
             self._save_subscriptions()
-            
+
         parts = []
         if removed:
             parts.append(f"✅ 已取消: {', '.join(sorted(removed))}。")
         elif valid_rem:
             parts.append(f"ℹ️ 指定类别未启用: {', '.join(sorted(valid_rem))}。")
-            
         if invalid_cats:
             parts.append(f"⚠️ 忽略无效: {', '.join(sorted(invalid_cats))}。")
-            
         final = self.notification_subscriptions.get(chat_id, set())
         parts.append(f"当前剩余: {', '.join(sorted(final)) if final else '无'}")
-        
-        yield event.plain_result("\n".join(parts))
+        return "\n".join(parts)
+
+    def _pick_best_media(self, candidates: list, title: str, year: str = "", media_type: str = ""):
+        """从搜索结果中挑选与用户意图最匹配的一条记录"""
+        target = (title or "").strip().lower()
+        best_item, best_score = None, 0
+        for item in candidates:
+            name = str(item.get("title") or "").strip().lower()
+            if not name:
+                continue
+            score = 0
+            if name == target:
+                score += 100
+            elif name.startswith(target) or target.startswith(name):
+                score += 50
+            elif target in name or name in target:
+                score += 30
+            if year and str(item.get("year") or "").strip() == str(year).strip():
+                score += 20
+            if media_type and item.get("type") == str(media_type).strip():
+                score += 20
+            if score > best_score:
+                best_item, best_score = item, score
+        return best_item
+
+    async def _get_tmdb_seasons(self, token: str, tmdb_id):
+        """获取 TMDB 剧集的季列表，请求失败返回 None"""
+        url = f"{self.base_url}/api/v1/tmdb/seasons/{tmdb_id}"
+        headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        self.logger.warning(f"查询季信息失败: {resp.status}", extra={"plugin": "mp"})
+                        return None
+                    seasons = await resp.json()
+                    # 兼容 {"success":..., "data": [...]} 包装
+                    if isinstance(seasons, dict):
+                        seasons = seasons.get("data")
+                    return seasons if isinstance(seasons, list) else []
+        except Exception as e:
+            self.logger.error(f"查询季信息异常: {e}", exc_info=True, extra={"plugin": "mp"})
+            return None
+
+    async def _subscribe_one(self, token: str, media_item: dict, display_name: str) -> str:
+        """提交单条订阅，返回结果文本"""
+        response = await self.add_subscription(token, self.transform_data(media_item))
+        if response and response.get("success") is True:
+            return f"✅ 已成功订阅{display_name}。"
+        error_msg = (response.get("msg") or response.get("message") or "未知错误") if isinstance(response, dict) else "未知错误"
+        return f"⚠️ 订阅{display_name}失败: {error_msg}"
+
+    @filter.llm_tool(name="mp_search_media")
+    async def llm_search_media(self, event: AstrMessageEvent, keyword: str) -> str:
+        """在 MoviePilot 媒体库中搜索电影、电视剧等影视资源。当用户想找片、搜片、查询某部影视能否下载或有哪些版本时调用。
+
+        Args:
+            keyword(string): 影视作品名称关键词，例如“黑暗荣耀”
+        """
+        token = await self._get_valid_token()
+        if not token:
+            return "错误：MoviePilot 登录失败，请检查插件配置中的用户名、密码与基础地址。"
+
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return "请提供要搜索的影视名称。"
+
+        media_data = await self.search_media(token, keyword)
+        cleaned = self.remove_empty_keys(media_data) if media_data else None
+        if not cleaned:
+            return f"未搜索到与“{keyword}”相关的影视资源。"
+
+        # 同时缓存给命令式订阅使用
+        self.user_search_results[str(event.unified_msg_origin)] = cleaned
+
+        lines = [f"共搜索到 {len(cleaned)} 条与“{keyword}”相关的结果："]
+        for i, item in enumerate(cleaned[: self.max_results], 1):
+            year = item.get("year")
+            year_str = f"({year})" if year else ""
+            tmdb_id = item.get("tmdb_id")
+            tmdb_str = f", TMDB ID: {tmdb_id}" if tmdb_id else ""
+            lines.append(
+                f"{i}. 《{item.get('title', '?')}》{year_str} 类型: {item.get('type', '?')} "
+                f"来源: {item.get('source') or item.get('media_source', '?')}{tmdb_str}"
+            )
+        lines.append("需要订阅时调用 mp_subscribe_media 工具；电视剧有多季时需先向用户确认季数。")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="mp_subscribe_media")
+    async def llm_subscribe_media(
+        self,
+        event: AstrMessageEvent,
+        title: str,
+        year: str = "",
+        season: str = "",
+        media_type: str = "",
+    ) -> str:
+        """在 MoviePilot 中新增订阅（自动追剧并下载）。当用户要求订阅、收藏、追某部电影或电视剧时调用。
+
+        Args:
+            title(string): 影视作品名称，建议使用搜索结果中的完整名称
+            year(string): 发行年份，用于区分同名作品，不确定时留空
+            season(string): 季数，如 "2"；用户要求全部季时传 "所有"；电视剧有多季且用户未指定季时留空，本工具会返回可选季列表
+            media_type(string): 媒体类型，取值为 "电影" 或 "电视剧"，不确定时留空
+        """
+        token = await self._get_valid_token()
+        if not token:
+            return "错误：MoviePilot 登录失败，请检查插件配置中的用户名、密码与基础地址。"
+
+        title = (title or "").strip()
+        if not title:
+            return "请提供要订阅的影视名称。"
+
+        candidates = self.remove_empty_keys(await self.search_media(token, title)) or []
+        if not candidates:
+            return f"未搜索到《{title}》，无法订阅，请先确认作品名称。"
+        item = self._pick_best_media(candidates, title, year, media_type)
+        if not item:
+            return f"未找到与《{title}》匹配的作品，请先调用 mp_search_media 确认准确名称。"
+
+        media_title = item.get("title") or title
+        season_arg = str(season).strip()
+        season_numbers = []
+
+        # 仅 TMDB 来源的电视剧需要选择季
+        if (item.get("source") or item.get("media_source")) == "themoviedb" and item.get("tmdb_id") and item.get("type") == "电视剧":
+            seasons = await self._get_tmdb_seasons(token, item.get("tmdb_id"))
+            if seasons is None:
+                return f"查询《{media_title}》的季信息失败，暂无法订阅。"
+            # 过滤掉第 0 季（特别篇），避免默认订阅或选季时错位
+            season_numbers = [s.get("season_number") for s in seasons if s.get("season_number")]
+            if len(season_numbers) > 1 and not season_arg:
+                lines = [f"《{media_title}》共有 {len(season_numbers)} 季，请先向用户确认要订阅哪一季："]
+                lines.extend(
+                    f"{i}. 第{s.get('season_number', '?')}季 {s.get('name', '')}".rstrip()
+                    for i, s in enumerate(seasons, 1)
+                )
+                lines.append("确认后再次调用本工具并传入 season（季数）；若用户要全部订阅，season 传“所有”。")
+                return "\n".join(lines)
+
+        if season_arg in ("所有", "全部", "all") and season_numbers:
+            targets = season_numbers
+        elif season_arg and season_numbers:
+            if not any(str(n) == season_arg for n in season_numbers):
+                return f"《{media_title}》不存在第 {season_arg} 季，可选季数: {', '.join(str(n) for n in season_numbers)}。"
+            targets = [int(season_arg)]
+        elif season_numbers:
+            targets = [season_numbers[0]]
+        else:
+            targets = [None]
+
+        results = []
+        for season_number in targets:
+            media_item = dict(item)
+            display_name = f"《{media_title}》"
+            if season_number is not None:
+                media_item["season"] = season_number
+                if item.get("type") == "电视剧":
+                    display_name = f"《{media_title}》第{season_number}季"
+            results.append(await self._subscribe_one(token, media_item, display_name))
+        return "\n".join(results)
+
+    @filter.llm_tool(name="mp_list_subscriptions")
+    async def llm_list_subscriptions(self, event: AstrMessageEvent) -> str:
+        """查看 MoviePilot 中当前的订阅列表与下载进度。用户询问已订阅了哪些影视、追剧进度如何时调用。"""
+        token = await self._get_valid_token()
+        if not token:
+            return "错误：MoviePilot 登录失败，请检查插件配置中的用户名、密码与基础地址。"
+
+        subscription_data = await self.get_subscription_data(token)
+        if not subscription_data:
+            return "获取订阅列表失败，或当前没有任何订阅。"
+        return self.format_subscription_data(subscription_data)
+
+    @filter.llm_tool(name="mp_search_subscription")
+    async def llm_search_subscription(
+        self, event: AstrMessageEvent, subscription_id: str = ""
+    ) -> str:
+        """立即让 MoviePilot 对订阅执行一次资源搜索（刷新、补种、重试下载）。用户要求刷新订阅或立即搜索资源时调用。
+
+        Args:
+            subscription_id(string): 订阅 ID；留空表示对所有订阅执行搜索
+        """
+        token = await self._get_valid_token()
+        if not token:
+            return "错误：MoviePilot 登录失败，请检查插件配置中的用户名、密码与基础地址。"
+
+        sub_id = (subscription_id or "").strip()
+        search_result = await self.search_subscription(token, sub_id)
+        if not search_result:
+            return "触发订阅搜索失败，请检查 MoviePilot 服务状态。"
+        if search_result.get("success"):
+            return f"✅ 已触发订阅搜索{f'（ID: {sub_id}）' if sub_id else ''}，资源搜索在 MoviePilot 后台执行。"
+        return f"⚠️ 订阅搜索失败: {search_result.get('msg') or search_result.get('message') or '未知错误'}"
+
+    @filter.llm_tool(name="mp_enable_notification")
+    async def llm_enable_notification(self, event: AstrMessageEvent, categories: str) -> str:
+        """在当前会话开启 MoviePilot 事件通知推送。当用户希望接收下载、整理入库、订阅等消息通知时调用。
+
+        Args:
+            categories(string): 通知类别，多个用 | 或逗号分隔。可选值: 资源下载、整理入库、订阅、媒体服务器、手动处理、插件、其他、站点、所有
+        """
+        return self._enable_notification_categories(
+            str(event.unified_msg_origin), self._parse_categories(categories)
+        )
+
+    @filter.llm_tool(name="mp_disable_notification")
+    async def llm_disable_notification(self, event: AstrMessageEvent, categories: str) -> str:
+        """关闭当前会话的 MoviePilot 事件通知推送。当用户不想再接收下载、入库、订阅等通知时调用。
+
+        Args:
+            categories(string): 要关闭的通知类别，多个用 | 或逗号分隔。可选值: 资源下载、整理入库、订阅、媒体服务器、手动处理、插件、其他、站点、所有
+        """
+        return self._disable_notification_categories(
+            str(event.unified_msg_origin), self._parse_categories(categories)
+        )
 
     @filter.regex(r"^[\s\S]+")
     async def handle_tmdb_season_input(self, event: AstrMessageEvent):
@@ -750,7 +966,7 @@ HTTP服务: {http_status}
                     if response and response.get("success") == True:
                         results.append(f"✅ `{media_title}` 第{season_number}季 订阅成功。")
                     else:
-                        error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                        error_msg = (response.get("msg") or response.get("message") or "看日志。") if isinstance(response, dict) else "看日志。"
                         results.append(f"⚠️ 订阅 `{media_title}` 第{season_number}季 失败: {error_msg}")
                 self.user_states.pop(userid, None)
                 self.pending_subscription.pop(userid, None)
@@ -779,7 +995,7 @@ HTTP服务: {http_status}
                     if response and response.get("success") == True:
                         yield event.plain_result(f"✅ `{media_title}` 第{season_number}季 订阅成功。")
                     else:
-                        error_msg = response.get("msg", "看日志。") if isinstance(response, dict) else "看日志。"
+                        error_msg = (response.get("msg") or response.get("message") or "看日志。") if isinstance(response, dict) else "看日志。"
                         yield event.plain_result(f"⚠️ 订阅 `{media_title}` 第{season_number}季 失败: {error_msg}")
                     self.user_states.pop(userid, None)
                     self.pending_subscription.pop(userid, None)
@@ -874,7 +1090,8 @@ HTTP服务: {http_status}
                     if response.status == 200:
                         data = await response.json()
                         self._log_and_check_daily('debug', f"媒体搜索响应内容: {data}", extra={"plugin": "mp"})
-                        return data
+                        # MoviePilot 返回 {"success":..., "data": [...]}，取出 data 字段
+                        return data.get("data") if isinstance(data, dict) else data
                     elif response.status == 401 and self.token_refresh_count < 1:
                         self._log_and_check_daily('warning', "搜索需要更新令牌", extra={"plugin": "mp"})
                         self.token_refresh_count += 1
@@ -904,7 +1121,8 @@ HTTP服务: {http_status}
                     if response.status == 200:
                         data = await response.json()
                         self._log_and_check_daily('debug', f"订阅数据响应内容: {data}", extra={"plugin": "mp"})
-                        return data
+                        # MoviePilot 返回 {"success":..., "data": [...]}，取出 data 字段
+                        return data.get("data") if isinstance(data, dict) else data
                     elif response.status == 401 and self.token_refresh_count < 1:
                         self._log_and_check_daily('warning', "获取订阅需要更新令牌", extra={"plugin": "mp"})
                         self.token_refresh_count += 1
@@ -950,7 +1168,7 @@ HTTP服务: {http_status}
             title = item.get("title", "?")
             year = item.get("year")
             mtype = item.get("type", "?")
-            src = item.get("source", "?")
+            src = item.get("source") or item.get("media_source", "?")
             detail_link = item.get("detail_link", "")
             
             year_str = f" ({year})" if year else ""
@@ -1129,7 +1347,7 @@ HTTP服务: {http_status}
         try:
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
+                async with session.post(url, headers=headers) as response:
                     self._log_and_check_daily('debug', f"搜索订阅响应状态: {response.status}", extra={"plugin": "mp"})
                     if response.status == 200:
                         data = await response.json()
